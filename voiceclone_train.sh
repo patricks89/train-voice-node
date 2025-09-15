@@ -4,7 +4,6 @@ set -euo pipefail
 ########################
 # USER-VARIABLEN
 ########################
-# Quellordner auf dem NAS mit Rohdaten (mp4/wav gemischt ok)
 NAS_SRC="/mnt/nas/Allgemein/VoiceClone/GianGiachen"
 
 # Lokale, schnelle NVMe-Ziele
@@ -19,7 +18,7 @@ NAS_OUT="${NAS_SRC}/checkpoints_out"
 
 # WhisperX Modell & Sprache
 WHISPER_MODEL="small"
-LANG="de"   # WhisperX erwartet 'de'
+LANG="de"
 
 # Hugging Face Token (optional)
 HF_TOKEN="${HF_TOKEN:-}"
@@ -28,7 +27,7 @@ HF_TOKEN="${HF_TOKEN:-}"
 IMG_WHISPER="whisper-tools"
 IMG_XTTS="xtts-finetune:cu121"
 
-# Für Subprozesse verfügbar machen
+# Für Subprozesse exportieren
 export LOCAL_ROOT LOCAL_DATA LOCAL_WAVS LOCAL_TXT LOCAL_CKPT NAS_OUT HF_TOKEN WHISPER_MODEL LANG
 
 ########################
@@ -54,11 +53,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ln -s /usr/bin/python3 /usr/bin/python && \
     rm -rf /var/lib/apt/lists/*
 
-# Torch-Stack passend zu CUDA 12.1 (OHNE torchvision!)
+# Torch-Stack (ohne torchvision)
 RUN pip install --upgrade pip && \
-    pip install \
-      torch==2.4.1+cu121 torchaudio==2.4.1 \
-      --index-url https://download.pytorch.org/whl/cu121
+    pip install torch==2.4.1+cu121 torchaudio==2.4.1 \
+    --index-url https://download.pytorch.org/whl/cu121
 
 # Audio/IO + sentencepiece
 RUN pip install "numpy<1.27,>=1.23" "pyarrow<16.2" soundfile librosa==0.10.2.post1 sentencepiece "torchmetrics<1"
@@ -70,7 +68,7 @@ RUN pip install "ctranslate2>=4.3" "faster-whisper==1.0.0"
 RUN pip install "transformers==4.40.2" accelerate && \
     pip install git+https://github.com/m-bain/whisperx.git
 
-# Sanity-Check (leichte Imports, kein pyannote/torchvision)
+# Sanity-Check (leichte Imports)
 RUN python - <<'PY'
 import os, torch
 print("torch", torch.__version__, "cuda:", torch.cuda.is_available())
@@ -163,7 +161,7 @@ find "${LOCAL_DATA}" -type f -iname '*.mp4' -print0 | \
 echo ">> MP4->WAV done"
 
 ########################
-# TRANSKRIPTION (GPU, fp16, batching)
+# TRANSKRIPTION (GPU, fp16, batching, VAD aus)
 ########################
 echo "==> Transkribiere WAVs mit WhisperX einmalig (GPU fp16, batching) …"
 docker run --rm --gpus all \
@@ -193,8 +191,8 @@ model = whisperx.load_model(
     model_name,
     device,
     compute_type=compute_type,
-    asr_options={"initial_prompt": "", "language": lang},  # Sprache explizit setzen
-    vad_options={"method": "none"}  # VAD explizit aus
+    asr_options={"initial_prompt": ""},
+    vad_options={"method": "none"}
 )
 
 wavs = sorted(glob.glob(os.path.join(wav_dir,"*.wav")))
@@ -206,8 +204,7 @@ for i, wav in enumerate(wavs, 1):
     if os.path.exists(txt_path):
         continue
     audio = whisperx.load_audio(wav)
-    # batch_size 16 ist ein guter Start; ggf. 32 bei mehr VRAM
-    result = model.transcribe(audio, batch_size=16)
+    result = model.transcribe(audio, batch_size=16, language=lang)
     with open(txt_path,"w",encoding="utf-8") as f:
         if "segments" in result:
             for seg in result["segments"]:
@@ -223,15 +220,15 @@ PY
 '
 
 ########################
-# MP4 AUFRÄUMEN (nicht mehr benötigt)
+# MP4 AUFRÄUMEN
 ########################
 echo "==> Lösche lokale MP4 (bereits in WAV umgewandelt) …"
 find "${LOCAL_DATA}" -type f -name "*.mp4" -delete || true
 
 ########################
-# METADATEN (Coqui: TAB-getrennt "audio_file<TAB>text")
+# METADATEN (Coqui: PIPE-getrennt "audio_file|text")
 ########################
-echo "==> Erzeuge train/eval Metadaten (Coqui, audio_file\\ttext) …"
+echo "==> Erzeuge train/eval Metadaten (Coqui, audio_file|text) …"
 env LOCAL_DATA="${LOCAL_DATA}" python3 - <<'PY'
 import os, glob, random, csv
 root = os.environ["LOCAL_DATA"]
@@ -259,22 +256,22 @@ eval_n = max(1, int(0.05 * len(pairs)))
 eval_set = pairs[:eval_n]
 train_set = pairs[eval_n:]
 
-def write_tsv(path, rows):
+def write_pipe(path, rows):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
+        w = csv.writer(f, delimiter="|")
         w.writerow(["audio_file","text"])
         for r in rows:
             w.writerow(r)
 
-train_csv = os.path.join(root, "metadata_train_coqui.csv")  # TSV, aber .csv ist ok
+train_csv = os.path.join(root, "metadata_train_coqui.csv")  # pipe-getrennt
 eval_csv  = os.path.join(root, "metadata_eval_coqui.csv")
-write_tsv(train_csv, train_set)
-write_tsv(eval_csv,  eval_set)
+write_pipe(train_csv, train_set)
+write_pipe(eval_csv,  eval_set)
 print(f">> train rows={len(train_set)}  eval rows={len(eval_set)}")
 PY
 
 ########################
-# TRAINING (direkt mit Coqui-TSV-Dateien)
+# TRAINING
 ########################
 echo "==> Starte XTTS GPT-Finetune (lokal, NVMe)…"
 docker run --rm -it --gpus all \
@@ -286,18 +283,44 @@ docker run --rm -it --gpus all \
 set -e
 cd /opt/xtts-ft
 
-# Optionaler Check: existieren die Dateien?
+# 1) Normalisiere Metadata auf Container-Pfade und stelle Pipe-Delimiter sicher
 python - << "PY"
 import os, pandas as pd
+root="/workspace/dataset"
+for split in ("train","eval"):
+    p=os.path.join(root, f"metadata_{split}_coqui.csv")
+    # flexibel lesen (falls alt): erkennt |, \t, , automatisch
+    df=pd.read_csv(p, sep=None, engine="python")
+    # auf Mindestspalten trimmen
+    if not {"audio_file","text"}.issubset(df.columns):
+        # Fallback: wenn nur 1. oder 2. Spalte da ist
+        cols=df.columns.tolist()
+        if len(cols)>=2:
+            df=df.rename(columns={cols[0]:"audio_file", cols[1]:"text"})
+        else:
+            raise RuntimeError(f"Unerwartetes Format in {p}")
+    df=df[["audio_file","text"]]
+    # Container-sichtbare Pfade
+    def map_path(x):
+        x=str(x)
+        return os.path.join("/workspace/dataset/wavs", os.path.basename(x))
+    df["audio_file"]=df["audio_file"].apply(map_path)
+    # Überschreibe als pipe-getrennt mit Header
+    df.to_csv(p, sep="|", index=False)
+    print("normalized", p, "rows=", len(df))
+PY
+
+# 2) Sanity-Check
+python - << "PY"
+import pandas as pd
 for p in ["/workspace/dataset/metadata_train_coqui.csv",
           "/workspace/dataset/metadata_eval_coqui.csv"]:
-    # sep=None + engine="python" lässt Pandas den TAB erkennen
-    df = pd.read_csv(p, sep=None, engine="python")
-    assert "audio_file" in df.columns and "text" in df.columns, f"Spalten fehlen in {p}"
+    df = pd.read_csv(p, sep="|")
+    assert "audio_file" in df.columns and "text" in df.columns
     print("OK:", p, "rows:", len(df))
 PY
 
-# Training direkt mit den Coqui-Metadaten
+# 3) Training mit Coqui-Metadaten (pipe)
 python3 train_gpt_xtts.py \
   --output_path /workspace/checkpoints \
   --metadatas /workspace/dataset/metadata_train_coqui.csv,/workspace/dataset/metadata_eval_coqui.csv,de \
