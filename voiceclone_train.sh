@@ -28,7 +28,7 @@ HF_TOKEN="${HF_TOKEN:-}"
 IMG_WHISPER="whisper-tools"
 IMG_XTTS="xtts-finetune:cu121"
 
-# Für Subprozesse verfügbar machen (Heredocs etc.)
+# Für Subprozesse verfügbar machen
 export LOCAL_ROOT LOCAL_DATA LOCAL_WAVS LOCAL_TXT LOCAL_CKPT NAS_OUT HF_TOKEN WHISPER_MODEL LANG
 
 ########################
@@ -163,9 +163,9 @@ find "${LOCAL_DATA}" -type f -iname '*.mp4' -print0 | \
 echo ">> MP4->WAV done"
 
 ########################
-# TRANSKRIPTION (einmal Modell laden, GPU, fp16, Batch, ohne VAD)
+# TRANSKRIPTION (GPU, fp16, batching)
 ########################
-echo "==> Transkribiere WAVs mit WhisperX einmalig (GPU fp16, batching, ohne VAD) …"
+echo "==> Transkribiere WAVs mit WhisperX einmalig (GPU fp16, batching) …"
 docker run --rm --gpus all \
   -e TRANSFORMERS_NO_TORCHVISION=1 \
   -e HF_TOKEN="${HF_TOKEN}" \
@@ -193,8 +193,8 @@ model = whisperx.load_model(
     model_name,
     device,
     compute_type=compute_type,
-    asr_options={"initial_prompt": ""},
-    vad_options={"method": "none"}
+    asr_options={"initial_prompt": "", "language": lang},  # Sprache explizit setzen
+    vad_options={"method": "none"}  # VAD explizit aus
 )
 
 wavs = sorted(glob.glob(os.path.join(wav_dir,"*.wav")))
@@ -206,15 +206,16 @@ for i, wav in enumerate(wavs, 1):
     if os.path.exists(txt_path):
         continue
     audio = whisperx.load_audio(wav)
-    result = model.transcribe(audio, batch_size=16, language=lang)
+    # batch_size 16 ist ein guter Start; ggf. 32 bei mehr VRAM
+    result = model.transcribe(audio, batch_size=16)
     with open(txt_path,"w",encoding="utf-8") as f:
         if "segments" in result:
             for seg in result["segments"]:
                 t = (seg.get("text") or "").strip()
-                if t: f.write(t+"\\n")
+                if t: f.write(t+"\n")
         else:
             t = (result.get("text") or "").strip()
-            if t: f.write(t+"\\n")
+            if t: f.write(t+"\n")
     if i % 10 == 0:
         print(f"[{i}/{len(wavs)}] {base}")
 print(">> transcription done")
@@ -228,9 +229,9 @@ echo "==> Lösche lokale MP4 (bereits in WAV umgewandelt) …"
 find "${LOCAL_DATA}" -type f -name "*.mp4" -delete || true
 
 ########################
-# METADATEN (Coqui-Format, rel. Pfade!)
+# METADATEN (Coqui: TAB-getrennt "audio_file<TAB>text")
 ########################
-echo "==> Erzeuge train/eval Metadaten (Coqui, audio_file,text) …"
+echo "==> Erzeuge train/eval Metadaten (Coqui, audio_file\\ttext) …"
 env LOCAL_DATA="${LOCAL_DATA}" python3 - <<'PY'
 import os, glob, random, csv
 root = os.environ["LOCAL_DATA"]
@@ -247,9 +248,7 @@ for wav in sorted(glob.glob(os.path.join(wav_dir, "*.wav"))):
         text = " ".join(line.strip() for line in f if line.strip())
     text = text.strip()
     if text:
-        # WICHTIG: relative Pfade ab LOCAL_DATA!
-        rel_wav = os.path.join("wavs", os.path.basename(wav))
-        pairs.append((rel_wav, text))
+        pairs.append((wav, text))
 
 if len(pairs) < 2:
     raise SystemExit("Zu wenige Samples für train/eval!")
@@ -260,22 +259,22 @@ eval_n = max(1, int(0.05 * len(pairs)))
 eval_set = pairs[:eval_n]
 train_set = pairs[eval_n:]
 
-def write_csv(path, rows):
+def write_tsv(path, rows):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f, delimiter="\t")
+        w = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
         w.writerow(["audio_file","text"])
-        for r in rows: 
+        for r in rows:
             w.writerow(r)
 
-train_csv = os.path.join(root, "metadata_train_coqui.csv")
+train_csv = os.path.join(root, "metadata_train_coqui.csv")  # TSV, aber .csv ist ok
 eval_csv  = os.path.join(root, "metadata_eval_coqui.csv")
-write_csv(train_csv, train_set)
-write_csv(eval_csv,  eval_set)
+write_tsv(train_csv, train_set)
+write_tsv(eval_csv,  eval_set)
 print(f">> train rows={len(train_set)}  eval rows={len(eval_set)}")
 PY
 
 ########################
-# TRAINING
+# TRAINING (direkt mit Coqui-TSV-Dateien)
 ########################
 echo "==> Starte XTTS GPT-Finetune (lokal, NVMe)…"
 docker run --rm -it --gpus all \
@@ -287,22 +286,18 @@ docker run --rm -it --gpus all \
 set -e
 cd /opt/xtts-ft
 
-# (Optional) kurzer Check, dass alle Pfade existieren:
+# Optionaler Check: existieren die Dateien?
 python - << "PY"
-import os, csv
-for split in ("train","eval"):
-    p=f"/workspace/dataset/metadata_{split}_coqui.csv"
-    ok=0; total=0
-    with open(p,encoding="utf-8") as f:
-        r=csv.DictReader(f)
-        for row in r:
-            total+=1
-            wav=os.path.join("/workspace/dataset", row["audio_file"])
-            ok+= os.path.exists(wav)
-    print(split, "rows=",total, "ok=",ok, "miss=", total-ok)
+import os, pandas as pd
+for p in ["/workspace/dataset/metadata_train_coqui.csv",
+          "/workspace/dataset/metadata_eval_coqui.csv"]:
+    # sep=None + engine="python" lässt Pandas den TAB erkennen
+    df = pd.read_csv(p, sep=None, engine="python")
+    assert "audio_file" in df.columns and "text" in df.columns, f"Spalten fehlen in {p}"
+    print("OK:", p, "rows:", len(df))
 PY
 
-# Training direkt mit Coqui-CSV
+# Training direkt mit den Coqui-Metadaten
 python3 train_gpt_xtts.py \
   --output_path /workspace/checkpoints \
   --metadatas /workspace/dataset/metadata_train_coqui.csv,/workspace/dataset/metadata_eval_coqui.csv,de \
