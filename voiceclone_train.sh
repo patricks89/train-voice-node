@@ -4,27 +4,20 @@ set -euo pipefail
 ########################
 # USER-VARIABLEN
 ########################
-# Quellordner auf dem NAS mit Rohdaten (mp4/wav gemischt ok)
 NAS_SRC="/mnt/nas/Allgemein/VoiceClone/GianGiachen"
 
-# Lokale, schnelle NVMe-Ziele
 LOCAL_ROOT="/mnt/nvme_pool/voiceclone"
 LOCAL_DATA="${LOCAL_ROOT}/dataset"
 LOCAL_WAVS="${LOCAL_DATA}/wavs"
 LOCAL_TXT="${LOCAL_DATA}/transcripts"
 LOCAL_CKPT="${LOCAL_ROOT}/checkpoints"
 
-# Zielordner auf dem NAS für fertige Checkpoints/Modelle
 NAS_OUT="${NAS_SRC}/checkpoints_out"
 
-# WhisperX Modell & Sprache
 WHISPER_MODEL="small"
-LANG="de"   # WhisperX erwartet 'de'
-
-# Hugging Face Token (optional)
+LANG="de"
 HF_TOKEN="${HF_TOKEN:-}"
 
-# Docker Image-Namen
 IMG_WHISPER="whisper-tools"
 IMG_XTTS="xtts-finetune:cu121"
 
@@ -51,27 +44,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ln -s /usr/bin/python3 /usr/bin/python && \
     rm -rf /var/lib/apt/lists/*
 
-# Torch-Stack passend zu CUDA 12.1
+# CUDA 12.1 Torch-Stack (passende Wheels)
 RUN pip install --upgrade pip && \
-    pip install \
-      torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1 \
-      --index-url https://download.pytorch.org/whl/cu121
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
+      torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1
 
-# Audio/IO + sentencepiece für Wav2Vec2-Tokenizer
-RUN pip install "numpy<1.27,>=1.23" "pandas<2.2.3" "pyarrow<16.2" soundfile librosa==0.10.2.post1 \
-    sentencepiece
+# Audio/IO + Tokenizer (ohne pandas)
+RUN pip install --no-cache-dir \
+      "numpy<1.27,>=1.23" soundfile librosa==0.10.2.post1 sentencepiece
 
-# Transformers + WhisperX
-RUN pip install transformers==4.40.2 accelerate && \
-    pip install git+https://github.com/m-bain/whisperx.git && \
-    pip install "torchmetrics<1"
+# Transformers + Accelerate OHNE deps (damit Torch nicht überschrieben wird)
+RUN pip install --no-cache-dir --no-deps transformers==4.40.2 accelerate==0.30.1
 
-# Sanity-Check (bricht Build ab, wenn Aligner fehlt)
+# WhisperX OHNE deps (sonst zieht es u.U. ein anderes torch)
+RUN pip install --no-cache-dir --no-deps git+https://github.com/m-bain/whisperx.git
+
+# Sicherheitsnetz: Torch-Stack erneut hart pinnen (falls irgendwas überschrieben wurde)
+RUN pip install --no-cache-dir --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu121 \
+      torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1
+
+# Sanity-Check (nur Torch, kein Vision-Import)
 RUN python - <<'PY'
 import torch
-print("torch", torch.__version__, "cuda:", torch.cuda.is_available())
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
-print("transformers Wav2Vec2ForCTC OK")
+print("torch:", torch.__version__, "cuda_available:", torch.cuda.is_available())
 PY
 
 ENTRYPOINT ["/usr/bin/tini","--"]
@@ -122,17 +117,17 @@ import os, re, shutil
 root = os.environ["LOCAL_DATA"]
 safe_re = re.compile(r'[^a-zA-Z0-9._-]')
 def sanitize(name: str) -> str:
-    base, ext = os.path.splitext(name)
-    return safe_re.sub('_', base) + safe_re.sub('_', ext)
+    b, e = os.path.splitext(name)
+    return safe_re.sub('_', b) + safe_re.sub('_', e)
 for dirpath, _, filenames in os.walk(root):
     for fn in filenames:
         src = os.path.join(dirpath, fn)
         new = sanitize(fn)
         if new != fn:
             dst = os.path.join(dirpath, new)
-            base, ext = os.path.splitext(new); i=1
+            b, e = os.path.splitext(new); i=1
             while os.path.exists(dst):
-                dst = os.path.join(dirpath, f"{base}_{i}{ext}"); i += 1
+                dst = os.path.join(dirpath, f"{b}_{i}{e}"); i += 1
             print(f"rename: {src} -> {dst}")
             shutil.move(src, dst)
 print(">> Filename-Sanitize fertig")
@@ -143,7 +138,6 @@ PY
 ########################
 echo "==> Konvertiere MP4 -> WAV (22050 Hz, mono) parallel …"
 mkdir -p "${LOCAL_WAVS}"
-# find alle MP4, parallel in so vielen Jobs wie CPU-Kerne
 export LOCAL_WAVS
 find "${LOCAL_DATA}" -type f -iname '*.mp4' -print0 | \
   xargs -0 -I{} -P"$(nproc)" bash -c '
@@ -159,9 +153,9 @@ find "${LOCAL_DATA}" -type f -iname '*.mp4' -print0 | \
 echo ">> MP4->WAV done"
 
 ########################
-# TRANSKRIPTION (einmal Modell laden, GPU, fp16, Batch)
+# TRANSKRIPTION (GPU fp16, batching, einmal laden)
 ########################
-echo "==> Transkribiere WAVs mit WhisperX einmalig (GPU fp16, batching) …"
+echo "==> Transkribiere WAVs mit WhisperX (GPU fp16, batching) …"
 docker run --rm --gpus all \
   -e TRANSFORMERS_NO_TORCHVISION=1 \
   -e HF_TOKEN="${HF_TOKEN}" \
@@ -171,64 +165,37 @@ docker run --rm --gpus all \
   "${IMG_WHISPER}" bash -lc '
 set -e
 python - << "PY"
-import os, glob, torch, json
-import whisperx
-
-root="/data"
-wav_dir=os.path.join(root,"wavs")
-out_dir=os.path.join(root,"transcripts")
+import os, glob, torch, whisperx
+root="/data"; wav_dir=os.path.join(root,"wavs"); out_dir=os.path.join(root,"transcripts")
 os.makedirs(out_dir, exist_ok=True)
-
 device="cuda" if torch.cuda.is_available() else "cpu"
 compute_type="float16" if device=="cuda" else "int8"
 model_name=os.environ.get("MODEL_NAME","small")
 lang=os.environ.get("LANG_CODE","de")
-
 print("load model:", model_name, "device:", device, "dtype:", compute_type)
 model = whisperx.load_model(model_name, device, compute_type=compute_type, asr_options={"initial_prompt": ""})
-
-# Aligner (optional; hier nur Textausgabe, aber Aligner beschleunigt Diarization – wir laden ihn, falls vorhanden)
-try:
-    align_model, metadata = whisperx.load_align_model(language_code=lang, device=device)
-except Exception as e:
-    align_model = None; metadata=None
-    print("align model not loaded:", e)
-
 wavs = sorted(glob.glob(os.path.join(wav_dir,"*.wav")))
-print("files:", len(wavs))
-
-# Batch-Transkription
 for i, wav in enumerate(wavs, 1):
     base=os.path.splitext(os.path.basename(wav))[0]
-    txt_path=os.path.join(out_dir, base+".txt")
-    if os.path.exists(txt_path):
-        continue
+    out=os.path.join(out_dir, base+".txt")
+    if os.path.exists(out): continue
     audio = whisperx.load_audio(wav)
-    # batch_size wirkt bei langen Audios/Chunks; 16 ist guter Start
     result = model.transcribe(audio, batch_size=16, language=lang)
-    # Optionales Alignment (hier nicht zum Schreiben benötigt)
-    if align_model is not None:
-        try:
-            result = whisperx.align(result["segments"], align_model, metadata, audio, device)
-        except Exception as e:
-            print("align fail:", base, e)
-    # Schreibe nur reinen Text (Zeile je Segment)
-    with open(txt_path,"w",encoding="utf-8") as f:
+    with open(out,"w",encoding="utf-8") as f:
         if "segments" in result:
             for seg in result["segments"]:
-                t = (seg.get("text") or "").strip()
+                t=(seg.get("text") or "").strip()
                 if t: f.write(t+"\n")
         else:
-            t = (result.get("text") or "").strip()
+            t=(result.get("text") or "").strip()
             if t: f.write(t+"\n")
-    if i % 10 == 0:
-        print(f"[{i}/{len(wavs)}] {base}")
+    if i % 10 == 0: print(f"[{i}/{len(wavs)}] {base}")
 print(">> transcription done")
 PY
 '
 
 ########################
-# MP4 AUFRÄUMEN (nicht mehr benötigt)
+# MP4 AUFRÄUMEN
 ########################
 echo "==> Lösche lokale MP4 (bereits in WAV umgewandelt) …"
 find "${LOCAL_DATA}" -type f -name "*.mp4" -delete || true
@@ -236,44 +203,28 @@ find "${LOCAL_DATA}" -type f -name "*.mp4" -delete || true
 ########################
 # METADATEN (ohne pandas)
 ########################
-echo "==> Erzeuge train/eval Metadaten (pure Python) …"
+echo "==> Erzeuge train/eval Metadaten …"
 python3 - <<'PY'
 import os, glob, random, csv
 root = os.environ["LOCAL_DATA"]
 wav_dir = os.path.join(root, "wavs")
 txt_dir = os.path.join(root, "transcripts")
-
-pairs = []
+pairs=[]
 for wav in sorted(glob.glob(os.path.join(wav_dir, "*.wav"))):
-    stem = os.path.splitext(os.path.basename(wav))[0]
-    txt_path = os.path.join(txt_dir, stem + ".txt")
-    if not os.path.exists(txt_path):
-        continue
-    with open(txt_path, "r", encoding="utf-8") as f:
-        text = " ".join(line.strip() for line in f if line.strip())
-    text = text.strip()
-    if text:
-        pairs.append((wav, text))
-
-if len(pairs) < 2:
-    raise SystemExit("Zu wenige Samples für train/eval!")
-
-random.seed(1337)
-random.shuffle(pairs)
-eval_n = max(1, int(0.05 * len(pairs)))
-eval_set = pairs[:eval_n]
-train_set = pairs[eval_n:]
-
+    stem=os.path.splitext(os.path.basename(wav))[0]
+    txt=os.path.join(txt_dir, stem+".txt")
+    if not os.path.exists(txt): continue
+    with open(txt, "r", encoding="utf-8") as f:
+        text=" ".join(line.strip() for line in f if line.strip())
+    if text: pairs.append((wav, text))
+if len(pairs)<2: raise SystemExit("Zu wenige Samples für train/eval!")
+random.seed(1337); random.shuffle(pairs)
+eval_n=max(1,int(0.05*len(pairs))); eval_set=pairs[:eval_n]; train_set=pairs[eval_n:]
 def write_csv(path, rows):
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["audio_file","text"])
-        for r in rows: w.writerow(r)
-
-train_csv = os.path.join(root, "metadata_train_coqui.csv")
-eval_csv  = os.path.join(root, "metadata_eval_coqui.csv")
-write_csv(train_csv, train_set)
-write_csv(eval_csv,  eval_set)
+    with open(path,"w",newline="",encoding="utf-8") as f:
+        w=csv.writer(f); w.writerow(["audio_file","text"]); w.writerows(rows)
+write_csv(os.path.join(root,"metadata_train_coqui.csv"), train_set)
+write_csv(os.path.join(root,"metadata_eval_coqui.csv"),  eval_set)
 print(f">> train rows={len(train_set)}  eval rows={len(eval_set)}")
 PY
 
@@ -289,46 +240,33 @@ docker run --rm -it --gpus all \
   "${IMG_XTTS}" bash -lc '
 set -e
 cd /opt/xtts-ft
-
-# Metadaten für das Training in Pipe-Format und Container-Pfade mappen
 python - << "PY"
 import os, csv
 root="/workspace/dataset"
-wav_dir=os.path.join(root,"wavs")
 def convert(split):
-    src=os.path.join(root, f"metadata_{split}_coqui.csv")
-    dst=os.path.join(root, f"metadata_{split}_pipe.csv")
+    src=os.path.join(root,f"metadata_{split}_coqui.csv")
+    dst=os.path.join(root,f"metadata_{split}_pipe.csv")
     rows=[]
-    with open(src, encoding="utf-8") as f:
+    with open(src,encoding="utf-8") as f:
         r=csv.DictReader(f)
         for row in r:
-            wav=row["audio_file"]
-            # im Container liegen die Dateien unter /workspace/dataset/wavs/<basename>.wav
-            mapped=os.path.join("/workspace/dataset/wavs", os.path.basename(wav))
+            mapped=os.path.join("/workspace/dataset/wavs", os.path.basename(row["audio_file"]))
             rows.append((mapped, row["text"]))
     with open(dst,"w",encoding="utf-8",newline="") as f:
-        w=csv.writer(f, delimiter="|")
-        for a,t in rows:
-            w.writerow([a,t])
+        w=csv.writer(f, delimiter="|"); [w.writerow(x) for x in rows]
     print("wrote", dst, "rows=",len(rows))
 for s in ("train","eval"): convert(s)
 PY
-
-# Kurzer Check
 python - << "PY"
 import os, csv
 for s in ("train","eval"):
     path=f"/workspace/dataset/metadata_{s}_pipe.csv"
     ok=0; total=0
     with open(path,encoding="utf-8") as f:
-        r=csv.reader(f, delimiter="|")
-        for row in r:
-            total+=1
-            ok+= os.path.exists(row[0])
-    print(s, "rows=",total, "ok=",ok, "miss=", total-ok)
+        for row in csv.reader(f, delimiter="|"):
+            total+=1; ok+= os.path.exists(row[0])
+    print(s,"rows=",total,"ok=",ok,"miss=",total-ok)
 PY
-
-# Training
 python3 train_gpt_xtts.py \
   --output_path /workspace/checkpoints \
   --metadatas /workspace/dataset/metadata_train_pipe.csv,/workspace/dataset/metadata_eval_pipe.csv,de \
