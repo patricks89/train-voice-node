@@ -323,7 +323,7 @@ PY
 # Training
 python3 train_gpt_xtts.py \
   --output_path /workspace/checkpoints \
-  --metadatas /workspace/dataset/metadata_train_pipe.csv,/workspace/dataset/metadata_eval_pipe.csv,de \
+  --metadatas /workspace/dataset/metadata_train_coqui.csv,/workspace/dataset/metadata_eval_coqui.csv,de \
   --num_epochs 5 \
   --batch_size 2 \
   --grad_acumm 6 \
