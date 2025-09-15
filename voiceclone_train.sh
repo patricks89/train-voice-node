@@ -65,20 +65,18 @@ RUN pip install --upgrade pip && \
 RUN pip install "numpy<1.27,>=1.23" "pyarrow<16.2" soundfile librosa==0.10.2.post1 \
     sentencepiece "torchmetrics<1"
 
-# Schnellere ASR-Backends und Abhängigkeiten, die WhisperX beim Import erwartet
-RUN pip install "ctranslate2>=4.3" "faster-whisper==1.0.0" \
-    "pyannote.audio==3.1.1"
+# Schnellere ASR-Backends
+RUN pip install "ctranslate2>=4.3" "faster-whisper==1.0.0"
 
 # Transformers + WhisperX
 RUN pip install "transformers==4.40.2" accelerate && \
     pip install git+https://github.com/m-bain/whisperx.git
 
-# Sanity-Check (nur leichte Imports)
+# Sanity-Check (nur leichte Imports, kein pyannote)
 RUN python - <<'PY'
 import torch
 print("torch", torch.__version__, "cuda:", torch.cuda.is_available())
 import ctranslate2, faster_whisper, whisperx
-from pyannote.audio.core.model import Model as _Dummy  # stellt sicher, dass pyannote geladen werden kann
 print("deps import OK")
 PY
 
@@ -198,7 +196,7 @@ model = whisperx.load_model(
     device,
     compute_type=compute_type,
     asr_options={"initial_prompt": ""},
-    vad_options={"method": "none"}   # VAD/diarization aus
+    vad_options={"method": "none"}   # VAD komplett deaktiviert
 )
 
 wavs = sorted(glob.glob(os.path.join(wav_dir,"*.wav")))
