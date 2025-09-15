@@ -28,9 +28,8 @@ HF_TOKEN="${HF_TOKEN:-}"
 IMG_WHISPER="whisper-tools"
 IMG_XTTS="xtts-finetune:cu121"
 
-# Diese Variablen in den ENV exportieren (für Python-Heredocs etc.)
-export NAS_SRC LOCAL_ROOT LOCAL_DATA LOCAL_WAVS LOCAL_TXT LOCAL_CKPT NAS_OUT
-export WHISPER_MODEL LANG HF_TOKEN IMG_WHISPER IMG_XTTS
+# Für Subprozesse verfügbar machen (Heredocs etc.)
+export LOCAL_ROOT LOCAL_DATA LOCAL_WAVS LOCAL_TXT LOCAL_CKPT NAS_OUT HF_TOKEN WHISPER_MODEL LANG
 
 ########################
 # PREP
@@ -46,36 +45,37 @@ cat > whisperx.Dockerfile <<'DOCK'
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    TRANSFORMERS_NO_TORCHVISION=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    TRANSFORMERS_NO_TORCHVISION=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv git ffmpeg tini && \
     ln -s /usr/bin/python3 /usr/bin/python && \
     rm -rf /var/lib/apt/lists/*
 
-# Torch-Stack passend zu CUDA 12.1
+# Torch-Stack passend zu CUDA 12.1 (OHNE torchvision!)
 RUN pip install --upgrade pip && \
     pip install \
-      torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1 \
+      torch==2.4.1+cu121 torchaudio==2.4.1 \
       --index-url https://download.pytorch.org/whl/cu121
 
-# Audio/IO + Tools
-RUN pip install "numpy<1.27,>=1.23" "pyarrow<16.2" soundfile librosa==0.10.2.post1 \
-    sentencepiece "torchmetrics<1"
+# Audio/IO + sentencepiece
+RUN pip install "numpy<1.27,>=1.23" "pyarrow<16.2" soundfile librosa==0.10.2.post1 sentencepiece "torchmetrics<1"
 
-# Schnellere ASR-Backends
+# Schnelles ASR-Backend
 RUN pip install "ctranslate2>=4.3" "faster-whisper==1.0.0"
 
 # Transformers + WhisperX
 RUN pip install "transformers==4.40.2" accelerate && \
     pip install git+https://github.com/m-bain/whisperx.git
 
-# Sanity-Check (nur leichte Imports, kein pyannote)
+# Sanity-Check (leichte Imports, kein pyannote/torchvision)
 RUN python - <<'PY'
-import torch
+import os, torch
 print("torch", torch.__version__, "cuda:", torch.cuda.is_available())
+# Flag sollte gesetzt sein
+print("TRANSFORMERS_NO_TORCHVISION =", os.environ.get("TRANSFORMERS_NO_TORCHVISION"))
 import ctranslate2, faster_whisper, whisperx
 print("deps import OK")
 PY
@@ -123,8 +123,7 @@ rsync -av --progress --delete \
 # DATEINAMEN SÄUBERN
 ########################
 echo "==> Säubere Dateinamen (nur a-zA-Z0-9._-) rekursiv …"
-# LOCAL_DATA ist exportiert -> für Python verfügbar
-python3 - <<'PY'
+env LOCAL_DATA="${LOCAL_DATA}" python3 - <<'PY'
 import os, re, shutil
 root = os.environ["LOCAL_DATA"]
 safe_re = re.compile(r'[^a-zA-Z0-9._-]')
@@ -165,7 +164,7 @@ find "${LOCAL_DATA}" -type f -iname '*.mp4' -print0 | \
 echo ">> MP4->WAV done"
 
 ########################
-# TRANSKRIPTION (GPU fp16, batching, ohne VAD)
+# TRANSKRIPTION (einmal Modell laden, GPU, fp16, Batch, ohne VAD)
 ########################
 echo "==> Transkribiere WAVs mit WhisperX einmalig (GPU fp16, batching, ohne VAD) …"
 docker run --rm --gpus all \
@@ -176,7 +175,7 @@ docker run --rm --gpus all \
   -v "${LOCAL_DATA}":/data \
   "${IMG_WHISPER}" bash -lc '
 set -e
-python3 - << "PY"
+python - << "PY"
 import os, glob, torch
 import whisperx
 
@@ -196,7 +195,7 @@ model = whisperx.load_model(
     device,
     compute_type=compute_type,
     asr_options={"initial_prompt": ""},
-    vad_options={"method": "none"}   # VAD komplett deaktiviert
+    vad_options={"method": "none"}
 )
 
 wavs = sorted(glob.glob(os.path.join(wav_dir,"*.wav")))
@@ -233,7 +232,7 @@ find "${LOCAL_DATA}" -type f -name "*.mp4" -delete || true
 # METADATEN (ohne pandas)
 ########################
 echo "==> Erzeuge train/eval Metadaten (pure Python) …"
-python3 - <<'PY'
+env LOCAL_DATA="${LOCAL_DATA}" python3 - <<'PY'
 import os, glob, random, csv
 root = os.environ["LOCAL_DATA"]
 wav_dir = os.path.join(root, "wavs")
@@ -287,7 +286,7 @@ set -e
 cd /opt/xtts-ft
 
 # Metadaten für das Training in Pipe-Format und Container-Pfade mappen
-python3 - << "PY"
+python - << "PY"
 import os, csv
 root="/workspace/dataset"
 def convert(split):
@@ -302,14 +301,13 @@ def convert(split):
             rows.append((mapped, row["text"]))
     with open(dst,"w",encoding="utf-8",newline="") as f:
         w=csv.writer(f, delimiter="|")
-        for a,t in rows:
-            w.writerow([a,t])
+        for a,t in rows: w.writerow([a,t])
     print("wrote", dst, "rows=",len(rows))
 for s in ("train","eval"): convert(s)
 PY
 
 # Kurzer Check
-python3 - << "PY"
+python - << "PY"
 import os, csv
 for s in ("train","eval"):
     path=f"/workspace/dataset/metadata_{s}_pipe.csv"
