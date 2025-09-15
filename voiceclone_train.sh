@@ -4,6 +4,7 @@ set -euo pipefail
 ########################
 # USER-VARIABLEN
 ########################
+# Quellordner auf dem NAS mit Rohdaten (mp4/wav gemischt ok)
 NAS_SRC="/mnt/nas/Allgemein/VoiceClone/GianGiachen"
 
 # Lokale, schnelle NVMe-Ziele
@@ -27,8 +28,9 @@ HF_TOKEN="${HF_TOKEN:-}"
 IMG_WHISPER="whisper-tools"
 IMG_XTTS="xtts-finetune:cu121"
 
-# Variablen für Python-Heredocs exportieren
-export LOCAL_DATA LOCAL_WAVS LOCAL_TXT
+# Diese Variablen in den ENV exportieren (für Python-Heredocs etc.)
+export NAS_SRC LOCAL_ROOT LOCAL_DATA LOCAL_WAVS LOCAL_TXT LOCAL_CKPT NAS_OUT
+export WHISPER_MODEL LANG HF_TOKEN IMG_WHISPER IMG_XTTS
 
 ########################
 # PREP
@@ -46,11 +48,10 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_NO_TORCHVISION=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONUNBUFFERED=1 \
-    HF_HUB_DISABLE_TELEMETRY=1
+    PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv git ffmpeg tini libsndfile1 && \
+    python3 python3-pip python3-venv git ffmpeg tini && \
     ln -s /usr/bin/python3 /usr/bin/python && \
     rm -rf /var/lib/apt/lists/*
 
@@ -60,27 +61,25 @@ RUN pip install --upgrade pip && \
       torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1 \
       --index-url https://download.pytorch.org/whl/cu121
 
-# Audio/IO + Tokenizer
-RUN pip install "numpy<1.27,>=1.23" "pyarrow<16.2" soundfile librosa==0.10.2.post1 sentencepiece
+# Audio/IO + Tools
+RUN pip install "numpy<1.27,>=1.23" "pyarrow<16.2" soundfile librosa==0.10.2.post1 \
+    sentencepiece "torchmetrics<1"
 
-# Kern-Abhängigkeiten für WhisperX: Transformers, Accelerate, TorchMetrics
-RUN pip install transformers==4.40.2 accelerate "torchmetrics<1"
+# Schnellere ASR-Backends und Abhängigkeiten, die WhisperX beim Import erwartet
+RUN pip install "ctranslate2>=4.3" "faster-whisper==1.0.0" \
+    "pyannote.audio==3.1.1"
 
-# Speech-Backend für WhisperX (GPU-fähig)
-# ctranslate2 + faster-whisper sind erforderlich, werden aber absichtlich ohne Torch neu zu ziehen installiert
-RUN pip install ctranslate2==4.4.0 faster-whisper==1.0.3
+# Transformers + WhisperX
+RUN pip install "transformers==4.40.2" accelerate && \
+    pip install git+https://github.com/m-bain/whisperx.git
 
-# WhisperX selbst ohne deps (um unseren Torch-Stack nicht zu überschreiben)
-RUN pip install --no-deps git+https://github.com/m-bain/whisperx.git
-
-# Sanity-Check
-RUN python3 - <<'PY'
+# Sanity-Check (nur leichte Imports)
+RUN python - <<'PY'
 import torch
 print("torch", torch.__version__, "cuda:", torch.cuda.is_available())
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
-print("transformers Wav2Vec2ForCTC OK")
-import ctranslate2, faster_whisper
-print("ctranslate2 & faster-whisper OK")
+import ctranslate2, faster_whisper, whisperx
+from pyannote.audio.core.model import Model as _Dummy  # stellt sicher, dass pyannote geladen werden kann
+print("deps import OK")
 PY
 
 ENTRYPOINT ["/usr/bin/tini","--"]
@@ -90,7 +89,7 @@ DOCK
 echo "==> Erzeuge xtts-finetune.Dockerfile …"
 cat > xtts-finetune.Dockerfile <<'DOCK'
 FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
-ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1 HF_HUB_DISABLE_TELEMETRY=1
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git ffmpeg sox tini libsndfile1 build-essential && \
     rm -rf /var/lib/apt/lists/*
@@ -98,7 +97,7 @@ RUN pip install --upgrade pip && \
     pip install "TTS@git+https://github.com/coqui-ai/TTS.git@main#egg=TTS"
 RUN git clone https://github.com/anhnh2002/XTTSv2-Finetuning-for-New-Languages.git /opt/xtts-ft && \
     pip install -r /opt/xtts-ft/requirements.txt
-RUN python3 - <<'PY'
+RUN python - <<'PY'
 from TTS.tts.configs.xtts_config import XttsConfig
 print("XttsConfig import OK")
 PY
@@ -126,6 +125,7 @@ rsync -av --progress --delete \
 # DATEINAMEN SÄUBERN
 ########################
 echo "==> Säubere Dateinamen (nur a-zA-Z0-9._-) rekursiv …"
+# LOCAL_DATA ist exportiert -> für Python verfügbar
 python3 - <<'PY'
 import os, re, shutil
 root = os.environ["LOCAL_DATA"]
@@ -167,9 +167,9 @@ find "${LOCAL_DATA}" -type f -iname '*.mp4' -print0 | \
 echo ">> MP4->WAV done"
 
 ########################
-# TRANSKRIPTION (einmal Modell laden, GPU, fp16, Batch)
+# TRANSKRIPTION (GPU fp16, batching, ohne VAD)
 ########################
-echo "==> Transkribiere WAVs mit WhisperX einmalig (GPU fp16, batching) …"
+echo "==> Transkribiere WAVs mit WhisperX einmalig (GPU fp16, batching, ohne VAD) …"
 docker run --rm --gpus all \
   -e TRANSFORMERS_NO_TORCHVISION=1 \
   -e HF_TOKEN="${HF_TOKEN}" \
@@ -193,14 +193,13 @@ model_name=os.environ.get("MODEL_NAME","small")
 lang=os.environ.get("LANG_CODE","de")
 
 print("load model:", model_name, "device:", device, "dtype:", compute_type)
-model = whisperx.load_model(model_name, device, compute_type=compute_type, asr_options={"initial_prompt": ""})
-
-# (optional) Alignment – nicht nötig für plain Text, aber harmless
-try:
-    align_model, metadata = whisperx.load_align_model(language_code=lang, device=device)
-except Exception as e:
-    align_model = None; metadata=None
-    print("align model not loaded:", e)
+model = whisperx.load_model(
+    model_name,
+    device,
+    compute_type=compute_type,
+    asr_options={"initial_prompt": ""},
+    vad_options={"method": "none"}   # VAD/diarization aus
+)
 
 wavs = sorted(glob.glob(os.path.join(wav_dir,"*.wav")))
 print("files:", len(wavs))
@@ -212,11 +211,6 @@ for i, wav in enumerate(wavs, 1):
         continue
     audio = whisperx.load_audio(wav)
     result = model.transcribe(audio, batch_size=16, language=lang)
-    if align_model is not None and "segments" in result:
-        try:
-            result = whisperx.align(result["segments"], align_model, metadata, audio, device)
-        except Exception as e:
-            print("align fail:", base, e)
     with open(txt_path,"w",encoding="utf-8") as f:
         if "segments" in result:
             for seg in result["segments"]:
@@ -232,7 +226,7 @@ PY
 '
 
 ########################
-# MP4 AUFRÄUMEN
+# MP4 AUFRÄUMEN (nicht mehr benötigt)
 ########################
 echo "==> Lösche lokale MP4 (bereits in WAV umgewandelt) …"
 find "${LOCAL_DATA}" -type f -name "*.mp4" -delete || true
@@ -294,7 +288,7 @@ docker run --rm -it --gpus all \
 set -e
 cd /opt/xtts-ft
 
-# Metadaten ins Pipe-Format und Container-Pfade mappen
+# Metadaten für das Training in Pipe-Format und Container-Pfade mappen
 python3 - << "PY"
 import os, csv
 root="/workspace/dataset"
