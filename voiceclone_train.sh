@@ -262,9 +262,10 @@ train_set = pairs[eval_n:]
 
 def write_csv(path, rows):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, delimiter="\t")
         w.writerow(["audio_file","text"])
-        for r in rows: w.writerow(r)
+        for r in rows: 
+            w.writerow(r)
 
 train_csv = os.path.join(root, "metadata_train_coqui.csv")
 eval_csv  = os.path.join(root, "metadata_eval_coqui.csv")
