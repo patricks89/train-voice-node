@@ -74,7 +74,6 @@ RUN pip install "transformers==4.40.2" accelerate && \
 RUN python - <<'PY'
 import os, torch
 print("torch", torch.__version__, "cuda:", torch.cuda.is_available())
-# Flag sollte gesetzt sein
 print("TRANSFORMERS_NO_TORCHVISION =", os.environ.get("TRANSFORMERS_NO_TORCHVISION"))
 import ctranslate2, faster_whisper, whisperx
 print("deps import OK")
@@ -212,10 +211,10 @@ for i, wav in enumerate(wavs, 1):
         if "segments" in result:
             for seg in result["segments"]:
                 t = (seg.get("text") or "").strip()
-                if t: f.write(t+"\n")
+                if t: f.write(t+"\\n")
         else:
             t = (result.get("text") or "").strip()
-            if t: f.write(t+"\n")
+            if t: f.write(t+"\\n")
     if i % 10 == 0:
         print(f"[{i}/{len(wavs)}] {base}")
 print(">> transcription done")
@@ -229,9 +228,9 @@ echo "==> Lösche lokale MP4 (bereits in WAV umgewandelt) …"
 find "${LOCAL_DATA}" -type f -name "*.mp4" -delete || true
 
 ########################
-# METADATEN (ohne pandas)
+# METADATEN (Coqui-Format, rel. Pfade!)
 ########################
-echo "==> Erzeuge train/eval Metadaten (pure Python) …"
+echo "==> Erzeuge train/eval Metadaten (Coqui, audio_file,text) …"
 env LOCAL_DATA="${LOCAL_DATA}" python3 - <<'PY'
 import os, glob, random, csv
 root = os.environ["LOCAL_DATA"]
@@ -248,7 +247,9 @@ for wav in sorted(glob.glob(os.path.join(wav_dir, "*.wav"))):
         text = " ".join(line.strip() for line in f if line.strip())
     text = text.strip()
     if text:
-        pairs.append((wav, text))
+        # WICHTIG: relative Pfade ab LOCAL_DATA!
+        rel_wav = os.path.join("wavs", os.path.basename(wav))
+        pairs.append((rel_wav, text))
 
 if len(pairs) < 2:
     raise SystemExit("Zu wenige Samples für train/eval!")
@@ -285,42 +286,22 @@ docker run --rm -it --gpus all \
 set -e
 cd /opt/xtts-ft
 
-# Metadaten für das Training in Pipe-Format und Container-Pfade mappen
+# (Optional) kurzer Check, dass alle Pfade existieren:
 python - << "PY"
 import os, csv
-root="/workspace/dataset"
-def convert(split):
-    src=os.path.join(root, f"metadata_{split}_coqui.csv")
-    dst=os.path.join(root, f"metadata_{split}_pipe.csv")
-    rows=[]
-    with open(src, encoding="utf-8") as f:
+for split in ("train","eval"):
+    p=f"/workspace/dataset/metadata_{split}_coqui.csv"
+    ok=0; total=0
+    with open(p,encoding="utf-8") as f:
         r=csv.DictReader(f)
         for row in r:
-            wav=row["audio_file"]
-            mapped=os.path.join("/workspace/dataset/wavs", os.path.basename(wav))
-            rows.append((mapped, row["text"]))
-    with open(dst,"w",encoding="utf-8",newline="") as f:
-        w=csv.writer(f, delimiter="|")
-        for a,t in rows: w.writerow([a,t])
-    print("wrote", dst, "rows=",len(rows))
-for s in ("train","eval"): convert(s)
-PY
-
-# Kurzer Check
-python - << "PY"
-import os, csv
-for s in ("train","eval"):
-    path=f"/workspace/dataset/metadata_{s}_pipe.csv"
-    ok=0; total=0
-    with open(path,encoding="utf-8") as f:
-        r=csv.reader(f, delimiter="|")
-        for row in r:
             total+=1
-            ok+= os.path.exists(row[0])
-    print(s, "rows=",total, "ok=",ok, "miss=", total-ok)
+            wav=os.path.join("/workspace/dataset", row["audio_file"])
+            ok+= os.path.exists(wav)
+    print(split, "rows=",total, "ok=",ok, "miss=", total-ok)
 PY
 
-# Training
+# Training direkt mit Coqui-CSV
 python3 train_gpt_xtts.py \
   --output_path /workspace/checkpoints \
   --metadatas /workspace/dataset/metadata_train_coqui.csv,/workspace/dataset/metadata_eval_coqui.csv,de \
