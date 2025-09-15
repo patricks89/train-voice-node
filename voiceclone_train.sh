@@ -4,7 +4,6 @@ set -euo pipefail
 ########################
 # USER-VARIABLEN
 ########################
-# Quellordner auf dem NAS mit Rohdaten (mp4/wav gemischt ok)
 NAS_SRC="/mnt/nas/Allgemein/VoiceClone/GianGiachen"
 
 # Lokale, schnelle NVMe-Ziele
@@ -28,7 +27,7 @@ HF_TOKEN="${HF_TOKEN:-}"
 IMG_WHISPER="whisper-tools"
 IMG_XTTS="xtts-finetune:cu121"
 
-# Variablen, die in Python-Heredocs gebraucht werden, ins Environment geben
+# Variablen für Python-Heredocs exportieren
 export LOCAL_DATA LOCAL_WAVS LOCAL_TXT
 
 ########################
@@ -61,19 +60,27 @@ RUN pip install --upgrade pip && \
       torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1 \
       --index-url https://download.pytorch.org/whl/cu121
 
-# Audio/IO + sentencepiece für Wav2Vec2-Tokenizer
+# Audio/IO + Tokenizer
 RUN pip install "numpy<1.27,>=1.23" "pyarrow<16.2" soundfile librosa==0.10.2.post1 sentencepiece
 
-# Transformers + accelerate + whisperx (ohne Abhängigkeits-Re-Installationen!)
-RUN pip install transformers==4.40.2 accelerate "torchmetrics<1" && \
-    pip install --no-deps git+https://github.com/m-bain/whisperx.git
+# Kern-Abhängigkeiten für WhisperX: Transformers, Accelerate, TorchMetrics
+RUN pip install transformers==4.40.2 accelerate "torchmetrics<1"
 
-# Sanity-Check (bricht Build ab, wenn Aligner/Imports fehlen)
+# Speech-Backend für WhisperX (GPU-fähig)
+# ctranslate2 + faster-whisper sind erforderlich, werden aber absichtlich ohne Torch neu zu ziehen installiert
+RUN pip install ctranslate2==4.4.0 faster-whisper==1.0.3
+
+# WhisperX selbst ohne deps (um unseren Torch-Stack nicht zu überschreiben)
+RUN pip install --no-deps git+https://github.com/m-bain/whisperx.git
+
+# Sanity-Check
 RUN python3 - <<'PY'
 import torch
 print("torch", torch.__version__, "cuda:", torch.cuda.is_available())
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 print("transformers Wav2Vec2ForCTC OK")
+import ctranslate2, faster_whisper
+print("ctranslate2 & faster-whisper OK")
 PY
 
 ENTRYPOINT ["/usr/bin/tini","--"]
@@ -188,7 +195,7 @@ lang=os.environ.get("LANG_CODE","de")
 print("load model:", model_name, "device:", device, "dtype:", compute_type)
 model = whisperx.load_model(model_name, device, compute_type=compute_type, asr_options={"initial_prompt": ""})
 
-# Aligner optional – wir brauchen nur Text
+# (optional) Alignment – nicht nötig für plain Text, aber harmless
 try:
     align_model, metadata = whisperx.load_align_model(language_code=lang, device=device)
 except Exception as e:
@@ -225,7 +232,7 @@ PY
 '
 
 ########################
-# MP4 AUFRÄUMEN (nicht mehr benötigt)
+# MP4 AUFRÄUMEN
 ########################
 echo "==> Lösche lokale MP4 (bereits in WAV umgewandelt) …"
 find "${LOCAL_DATA}" -type f -name "*.mp4" -delete || true
