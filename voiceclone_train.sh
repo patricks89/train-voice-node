@@ -194,7 +194,7 @@ def load_model_safe(compute_type):
         device,
         compute_type=compute_type,
         # pass language directly to the ASR; helps stability
-        asr_options={"initial_prompt": "", "language": lang},
+        asr_options={"initial_prompt": ""},
         # turn on VAD for cleaner segments; if pyannote issues occur, set method="none"
         vad_options={"method": "pyannote", "min_speech_duration_ms": 250},
     )
@@ -363,8 +363,7 @@ python3 train_gpt_xtts.py \
   --max_audio_length 220500 \
   --weight_decay 1e-2 \
   --lr 5e-6 \
-  --save_step 200 \
-  --save_on_epoch_end True
+  --save_step 25 \
 '
 
 ########################
