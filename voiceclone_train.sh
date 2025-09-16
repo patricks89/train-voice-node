@@ -7,7 +7,7 @@ set -euo pipefail
 NAS_SRC="/mnt/nas/Allgemein/VoiceClone/GianGiachen"
 
 # Lokale, schnelle NVMe-Ziele
-LOCAL_ROOT="/mnt/nvme_pool/voiceclone"
+LOCAL_ROOT="/mnt/nvme_pool"
 LOCAL_DATA="${LOCAL_ROOT}/dataset"
 LOCAL_WAVS="${LOCAL_DATA}/wavs"
 LOCAL_TXT="${LOCAL_DATA}/transcripts"
@@ -17,7 +17,7 @@ LOCAL_CKPT="${LOCAL_ROOT}/checkpoints"
 NAS_OUT="${NAS_SRC}/checkpoints_out"
 
 # WhisperX Modell & Sprache
-WHISPER_MODEL="small"
+WHISPER_MODEL="large-v3"
 LANG="de"
 
 # Hugging Face Token (optional)
@@ -176,43 +176,61 @@ python - << "PY"
 import os, glob, torch
 import whisperx
 
-root="/data"
-wav_dir=os.path.join(root,"wavs")
-out_dir=os.path.join(root,"transcripts")
+root = "/data"
+wav_dir = os.path.join(root, "wavs")
+out_dir = os.path.join(root, "transcripts")
 os.makedirs(out_dir, exist_ok=True)
 
-device="cuda" if torch.cuda.is_available() else "cpu"
-compute_type="float16" if device=="cuda" else "int8"
-model_name=os.environ.get("MODEL_NAME","small")
-lang=os.environ.get("LANG_CODE","de")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+# try fp16 first; if OOM happens, switch to int8_float16 (less VRAM, a bit slower)
+preferred = "float16" if device == "cuda" else "int8"
+model_name = os.environ.get("MODEL_NAME", "large-v3")
+lang = os.environ.get("LANG_CODE", "de")
 
-print("load model:", model_name, "device:", device, "dtype:", compute_type)
-model = whisperx.load_model(
-    model_name,
-    device,
-    compute_type=compute_type,
-    asr_options={"initial_prompt": ""},
-    vad_options={"method": "none"}
-)
+def load_model_safe(compute_type):
+    print(f"load model: {model_name}  device: {device}  dtype: {compute_type}")
+    return whisperx.load_model(
+        model_name,
+        device,
+        compute_type=compute_type,
+        # pass language directly to the ASR; helps stability
+        asr_options={"initial_prompt": "", "language": lang},
+        # turn on VAD for cleaner segments; if pyannote issues occur, set method="none"
+        vad_options={"method": "pyannote", "min_speech_duration_ms": 250},
+    )
 
-wavs = sorted(glob.glob(os.path.join(wav_dir,"*.wav")))
+try:
+    model = load_model_safe(preferred)
+except Exception as e:
+    if device == "cuda" and preferred != "int8_float16":
+        print(f"Falling back to int8_float16 due to: {e}")
+        model = load_model_safe("int8_float16")
+    else:
+        raise
+
+wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
 print("files:", len(wavs))
 
+# keep batch small to fit 11GB on 2080 Ti
+BATCH = 6 if device == "cuda" else 2
+
 for i, wav in enumerate(wavs, 1):
-    base=os.path.splitext(os.path.basename(wav))[0]
-    txt_path=os.path.join(out_dir, base+".txt")
+    base = os.path.splitext(os.path.basename(wav))[0]
+    txt_path = os.path.join(out_dir, base + ".txt")
     if os.path.exists(txt_path):
         continue
     audio = whisperx.load_audio(wav)
-    result = model.transcribe(audio, batch_size=16, language=lang)
-    with open(txt_path,"w",encoding="utf-8") as f:
+    result = model.transcribe(audio, batch_size=BATCH, language=lang)
+    with open(txt_path, "w", encoding="utf-8") as f:
         if "segments" in result:
             for seg in result["segments"]:
                 t = (seg.get("text") or "").strip()
-                if t: f.write(t+"\n")
+                if t:
+                    f.write(t + "\n")
         else:
             t = (result.get("text") or "").strip()
-            if t: f.write(t+"\n")
+            if t:
+                f.write(t + "\n")
     if i % 10 == 0:
         print(f"[{i}/{len(wavs)}] {base}")
 print(">> transcription done")
@@ -231,43 +249,58 @@ find "${LOCAL_DATA}" -type f -name "*.mp4" -delete || true
 echo "==> Erzeuge train/eval Metadaten (Coqui, audio_file|text) …"
 env LOCAL_DATA="${LOCAL_DATA}" python3 - <<'PY'
 import os, glob, random, csv
-root = os.environ["LOCAL_DATA"]
+
+root    = os.environ["LOCAL_DATA"]
 wav_dir = os.path.join(root, "wavs")
 txt_dir = os.path.join(root, "transcripts")
 
+MAX_LEN = 250            # harte Grenze pro Zeile (XTTS ~253)
+EVAL_MIN = 3             # mindestens 3 Eval-Zeilen
+EVAL_FRAC = 0.10         # 10% Eval
 pairs = []
+
+def chunk_text(t, max_len=MAX_LEN):
+    t = " ".join(x.strip() for x in t.split())  # normalize whitespace
+    if len(t) <= max_len:
+        return [t]
+    return [ t[i:i+max_len] for i in range(0, len(t), max_len) ]
+
 for wav in sorted(glob.glob(os.path.join(wav_dir, "*.wav"))):
     stem = os.path.splitext(os.path.basename(wav))[0]
     txt_path = os.path.join(txt_dir, stem + ".txt")
     if not os.path.exists(txt_path):
         continue
     with open(txt_path, "r", encoding="utf-8") as f:
-        text = " ".join(line.strip() for line in f if line.strip())
-    text = text.strip()
-    if text:
-        pairs.append((wav, text))
+        text = " ".join(line.strip() for line in f if line.strip()).strip()
+    if not text:
+        continue
+    # --- Container-Pfad direkt reinschreiben ---
+    wav_ctr = "/workspace/dataset/wavs/" + os.path.basename(wav)
+    # --- lange Texte in <=MAX_LEN-Stücke splitten ---
+    for chunk in chunk_text(text):
+        pairs.append((wav_ctr, chunk))
 
 if len(pairs) < 2:
     raise SystemExit("Zu wenige Samples für train/eval!")
 
-random.seed(1337)
-random.shuffle(pairs)
-eval_n = max(1, int(0.05 * len(pairs)))
-eval_set = pairs[:eval_n]
+# Kürzere Zeilen bevorzugt für Eval auswählen (um Filter zu vermeiden)
+pairs.sort(key=lambda r: len(r[1]))
+eval_n = max(EVAL_MIN, int(EVAL_FRAC * len(pairs)))
+eval_set  = pairs[:eval_n]
 train_set = pairs[eval_n:]
 
 def write_pipe(path, rows):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f, delimiter="|")
+        w = csv.writer(f, delimiter="|", quoting=csv.QUOTE_ALL)
         w.writerow(["audio_file","text"])
         for r in rows:
             w.writerow(r)
 
-train_csv = os.path.join(root, "metadata_train_coqui.csv")  # pipe-getrennt
+train_csv = os.path.join(root, "metadata_train_coqui.csv")
 eval_csv  = os.path.join(root, "metadata_eval_coqui.csv")
 write_pipe(train_csv, train_set)
 write_pipe(eval_csv,  eval_set)
-print(f">> train rows={len(train_set)}  eval rows={len(eval_set)}")
+print(f">> train rows={len(train_set)}  eval rows={len(eval_set)} (total after split={len(pairs)})")
 PY
 
 ########################
@@ -276,7 +309,6 @@ PY
 echo "==> Starte XTTS GPT-Finetune (lokal, NVMe)…"
 docker run --rm -it --gpus all \
   -e CUDA_VISIBLE_DEVICES=0 \
-  -e PYTORCH_CUDA_ALLOC_CONF="expandable_segments:true" \
   -v "${LOCAL_DATA}":/workspace/dataset \
   -v "${LOCAL_CKPT}":/workspace/checkpoints \
   "${IMG_XTTS}" bash -lc '
@@ -289,23 +321,23 @@ import os, pandas as pd
 root="/workspace/dataset"
 for split in ("train","eval"):
     p=os.path.join(root, f"metadata_{split}_coqui.csv")
-    # flexibel lesen (falls alt): erkennt |, \t, , automatisch
-    df=pd.read_csv(p, sep=None, engine="python")
-    # auf Mindestspalten trimmen
-    if not {"audio_file","text"}.issubset(df.columns):
-        # Fallback: wenn nur 1. oder 2. Spalte da ist
+    # Korrekt: Quotes parsen lassen, Pipe als Trenner
+    df=pd.read_csv(p, sep="|", engine="python")
+    # Spalten prüfen
+    need={"audio_file","text"}
+    if not need.issubset(df.columns):
         cols=df.columns.tolist()
         if len(cols)>=2:
             df=df.rename(columns={cols[0]:"audio_file", cols[1]:"text"})
         else:
             raise RuntimeError(f"Unerwartetes Format in {p}")
     df=df[["audio_file","text"]]
-    # Container-sichtbare Pfade
-    def map_path(x):
-        x=str(x)
-        return os.path.join("/workspace/dataset/wavs", os.path.basename(x))
-    df["audio_file"]=df["audio_file"].apply(map_path)
-    # Überschreibe als pipe-getrennt mit Header
+    # Defensive: Whitespace strippen
+    df["audio_file"]=df["audio_file"].astype(str).str.strip()
+    df["text"]=df["text"].astype(str).str.strip()
+    # Optional: Plausibilitätscheck der ersten 3 Zeilen
+    print("Preview", p, ":\n", df.head(3).to_string(index=False))
+    # Keine Pfad-Umschreibung mehr nötig, CSV enthält Container-Pfade
     df.to_csv(p, sep="|", index=False)
     print("normalized", p, "rows=", len(df))
 PY
@@ -331,7 +363,8 @@ python3 train_gpt_xtts.py \
   --max_audio_length 220500 \
   --weight_decay 1e-2 \
   --lr 5e-6 \
-  --save_step 2000
+  --save_step 200 \
+  --save_on_epoch_end True
 '
 
 ########################
