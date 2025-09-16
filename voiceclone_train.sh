@@ -370,6 +370,21 @@ python3 train_gpt_xtts.py \
 # EXPORT ZUM NAS
 ########################
 echo "==> Exportiere Checkpoints zum NAS …"
-rsync -av --progress "${LOCAL_CKPT}/" "${NAS_OUT}/"
+
+LATEST_CKPT="$(ls -dt ${LOCAL_CKPT}/GPT_XTTS_FT-* | head -n1)"
+
+# 1) Adapter-Export (nur Finetune)
+ADAPTER_DIR="${NAS_OUT}/GianGiachen_ft"
+mkdir -p "${ADAPTER_DIR}"
+cp "${LATEST_CKPT}/checkpoint_"*.pth "${ADAPTER_DIR}/"
+cp "${LATEST_CKPT}/config.json" "${ADAPTER_DIR}/"
+echo ">> Adapter-Export nach ${ADAPTER_DIR}"
+
+# 2) Full Replacement-Export (eigenständiges Modell)
+FULL_DIR="${NAS_OUT}/GianGiachen_full"
+mkdir -p "${FULL_DIR}"
+cp "${LATEST_CKPT}/checkpoint_"*.pth "${FULL_DIR}/model.pth"
+cp "${LATEST_CKPT}/config.json" "${FULL_DIR}/"
+echo ">> Full Replacement-Export nach ${FULL_DIR}"
 
 echo "✅ Fertig."
