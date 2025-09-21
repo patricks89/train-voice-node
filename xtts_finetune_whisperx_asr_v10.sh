@@ -35,11 +35,6 @@ set -euo pipefail
 #   HF_HOME, TRANSFORMERS_CACHE,
 #   TORCH_HOME, XDG_CACHE_HOME      zeigen alle auf /cache (persistent)
 #
-# STORAGE-LAYOUT (wie bei dir):
-#   SCRATCH  : /mnt/fast_scratch  (flüchtig; Transcodierung, WAV-Segmente, tmp)
-#   STORE    : /mnt/fast_store    (persistent; Checkpoints, Caches)
-#   RAM-CKPT : /mnt/ram_ckpt      (tmpfs; Checkpoints während des Trainings)
-#
 # Das Skript:
 #   1) Sorgt dafür, dass Mounts vorhanden sind und leer **zu Beginn**:
 #        - /mnt/ram_ckpt wird geleert (tmpfs).
