@@ -35,13 +35,37 @@ set -euo pipefail
 #   HF_HOME, TRANSFORMERS_CACHE,
 #   TORCH_HOME, XDG_CACHE_HOME      zeigen alle auf /cache (persistent)
 ###############################################################################
+###############################################################################
+# XTTS Finetune + WhisperX ASR — v10 (self-healing edition)
+#
+# STORAGE-LAYOUT (wie bei dir):
+#   SCRATCH  : /mnt/fast_scratch  (flüchtig; Transcodierung, WAV-Segmente, tmp)
+#   STORE    : /mnt/fast_store    (persistent; Checkpoints, Caches)
+#   RAM-CKPT : /mnt/ram_ckpt      (tmpfs; Checkpoints während des Trainings)
+#
+# Das Skript:
+#   1) Sorgt dafür, dass Mounts vorhanden sind und leer **zu Beginn**:
+#        - /mnt/ram_ckpt wird geleert (tmpfs).
+#        - /mnt/fast_scratch wird geleert.
+#   2) Zieht benötigte Docker-Images automatisch (WhisperX & Python slim).
+#        - IMG_XTTS wird versucht zu pullen; falls kein Registry-Pfad, Hinweis.
+#   3) Synchronisiert Rohdaten (mp4/wav) vom NAS → SCRATCH.
+#   4) Transcodiert mp4 → wav @SR mono.
+#   5) WhisperX-Transkription (+Dialekt-Prompt), segmentiert & chunkt.
+#   6) Schneidet WAV-Segmente, baut CSVs.
+#   7) Startet XTTS-Training (Checkpoints in RAM) und spiegelt letztes Run → STORE.
+#   8) Exportiert "latest_full" + besorgt Tokenizer-Assets (HF) via python:3.11-slim.
+#
+# DEBUG:
+#   DEBUG=1 ./xtts_finetune_whisperx_asr_v10.sh   # zeigt set -x
+###############################################################################
 
 ########################
-# STORAGE-LAYOUT
+# KONFIG (überschreibbar via Env)
 ########################
-SCRATCH_ROOT="/mnt/fast_scratch"         # flüchtig
-STORE_ROOT="/mnt/fast_store"             # persistent
-RAM_CKPT_ROOT="/mnt/ram_ckpt"            # tmpfs (15G)
+SCRATCH_ROOT="${SCRATCH_ROOT:-/mnt/fast_scratch}"    # flüchtig
+STORE_ROOT="${STORE_ROOT:-/mnt/fast_store}"          # persistent
+RAM_CKPT_ROOT="${RAM_CKPT_ROOT:-/mnt/ram_ckpt}"      # tmpfs (z.B. 15G)
 
 # Unterordner
 SCRATCH_DATA="${SCRATCH_ROOT}/dataset"
@@ -49,21 +73,21 @@ SCRATCH_WAVS="${SCRATCH_DATA}/wavs"
 SCRATCH_TMP="${SCRATCH_ROOT}/tmp"
 
 STORE_CKPT="${STORE_ROOT}/checkpoints"
-PERSISTENT_CACHE="${STORE_ROOT}/cache"   # persistente Caches (HF/Torch/…)
+PERSISTENT_CACHE="${STORE_ROOT}/cache"   # persistente Caches (HF/Torch/Pip)
 
-# Optional: Docker-Temp auf Scratch (schont Systemdisk)
+# Optional: Docker-Temp auf Scratch
 export DOCKER_TMPDIR="${SCRATCH_ROOT}/docker-tmp"
 
-########################
-# USER-VARS
-########################
-HF_TOKEN="${HF_TOKEN:-}"
-NAS_SRC="${NAS_SRC:-/mnt/nas/Allgemein/VoiceClone/*}" #Configure Path 
+# HF-Token (leer lassen, wenn nur public Modelle)
+HF_TOKEN="${HF_TOKEN:-hf_xyz}"
+
+# Rohdaten-Quelle
+NAS_SRC="${NAS_SRC:-/mnt/nas/Allgemein/VoiceClone/*}"
 
 # WhisperX / ASR
 WHISPER_MODEL="${WHISPER_MODEL:-large-v3}"
-WHISPER_FORCE_LANG="${WHISPER_FORCE_LANG:-}"      # "" = Auto, sonst "de"
-VAD_METHOD="${VAD_METHOD:-none}"                  # none|silero
+WHISPER_FORCE_LANG="${WHISPER_FORCE_LANG:-}"    # ""=Auto sonst "de"
+VAD_METHOD="${VAD_METHOD:-none}"                # none|silero
 
 # Dialekt-Prompt
 DIALECT_HINT="${DIALECT_HINT:-Allegra, Grüezi, Chur, Bündner, nöd, nüüt, öppis, chli, lueg, tuet, wos, dä, d’, miar, bisch, goht, gits, schaffa, gäge, nid, üs, äbe, gaht, gäll.}"
@@ -71,7 +95,7 @@ LEXICON_FILE="${LEXICON_FILE:-${STORE_ROOT}/dialect_lexicon.txt}"      # persist
 
 # Dataset / Training
 LANG_TAG="${LANG_TAG:-de}"
-SR="${SR:-24000}"                              # 24 kHz für XTTS „cleaner“
+SR="${SR:-24000}"                     # 24k für XTTS v2 ist üblich
 MAX_TXT_CHARS="${MAX_TXT_CHARS:-180}"
 MIN_DUR="${MIN_DUR:-0.6}"
 TARGET_DUR="${TARGET_DUR:-5.0}"
@@ -89,19 +113,41 @@ CLEAN_AFTER_RUN="${CLEAN_AFTER_RUN:-1}"          # 1 = nach Export RAM+Scratch l
 RAMCKPT_MIN_FREE_GB="${RAMCKPT_MIN_FREE_GB:-5}"  # Mindestfrei für RAM-ckpt
 
 # Docker Images
-IMG_WHISPER="${IMG_WHISPER:-whisper-tools}"
+# WhisperX: öffentlich verfügbar → wir ziehen automatisch, falls fehlt.
+IMG_WHISPER="${IMG_WHISPER:-ghcr.io/m-bain/whisperx:latest}"
+# XTTS: Dein custom Image (enthält /opt/xtts-ft/train_gpt_xtts.py)
+# Wenn das Bild keinen Registry-Pfad enthält (kein "/"), versuchen wir trotzdem zu pullen.
+# Scheitert das, bekommst du eine klare Meldung (siehe ensure_docker_image_or_pull).
 IMG_XTTS="${IMG_XTTS:-xtts-finetune:cu121}"
+# Für Tokenizer-Export:
+IMG_PY_SLIM="${IMG_PY_SLIM:-python:3.11-slim}"
 
-export \
-  SCRATCH_ROOT SCRATCH_DATA SCRATCH_WAVS SCRATCH_TMP \
-  STORE_ROOT STORE_CKPT RAM_CKPT_ROOT PERSISTENT_CACHE \
-  HF_TOKEN WHISPER_MODEL LANG_TAG IMG_XTTS WHISPER_FORCE_LANG DIALECT_HINT \
-  MAX_TXT_CHARS MIN_DUR MAX_DUR TARGET_DUR SR DIALECT_REWRITE RAW_DIALECT_REWRITE VAD_METHOD \
-  REWRITE_FILE LEXICON_FILE MAX_AUDIO_SAMPLES SAVE_STEP CLEAN_AFTER_RUN
+# Export-Schalter:
+DO_EXPORT="${DO_EXPORT:-1}"   # 1 = latest_full exportieren + Tokenizer ziehen
 
 ########################
-# Helpers
+# ENV für Container-Caches
 ########################
+docker_env_persistent_cache=(
+  -e HF_HOME=/cache/hf
+  -e TRANSFORMERS_CACHE=/cache/hf/transformers
+  -e TORCH_HOME=/cache/torch
+  -e XDG_CACHE_HOME=/cache
+)
+docker_env_hf_token=()
+if [[ -n "${HF_TOKEN}" ]]; then
+  docker_env_hf_token+=(
+    -e "HF_TOKEN=${HF_TOKEN}"
+    -e "HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}"
+    -e "HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}"
+  )
+fi
+
+########################
+# UTILs
+########################
+[[ "${DEBUG:-0}" = "1" ]] && set -x
+
 say() { echo "==> $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -114,7 +160,8 @@ bytes_to_human() {
 }
 
 safe_empty_dir() {
-  local dir="$1"; shift
+  # Leert ein Verzeichnis (optionales "keep"-Listing von Basenamen)
+  local dir="$1"; shift || true
   local keep=("$@")
   [[ -d "$dir" ]] || return 0
   shopt -s dotglob nullglob
@@ -122,7 +169,7 @@ safe_empty_dir() {
     [[ -e "$p" ]] || continue
     local base="$(basename "$p")"
     local skip=0
-    for k in "${keep[@]}"; do
+    for k in "${keep[@]:-}"; do
       [[ "$base" == "$k" ]] && { skip=1; break; }
     done
     (( skip )) && continue
@@ -131,94 +178,143 @@ safe_empty_dir() {
   shopt -u dotglob nullglob
 }
 
-ensure_dirs() {
-  mkdir -p \
-    "$SCRATCH_WAVS" \
-    "$SCRATCH_TMP" \
-    "$STORE_CKPT" \
-    "$PERSISTENT_CACHE/hf" "$PERSISTENT_CACHE/torch" "$PERSISTENT_CACHE/pip" \
-    "$RAM_CKPT_ROOT" \
-    "$SCRATCH_ROOT/docker-tmp"
+ensure_dir() { mkdir -p -- "$1"; }
+
+ensure_mount() {
+  # ensure_mount <pfad> [erwarteter_fstype]
+  local path="$1"; local want_fstype="${2:-}"
+  if ! mountpoint -q "$path"; then
+    say "WARN: $path ist nicht gemountet – versuche mount -a …"
+    mount -a || true
+  fi
+  if ! mountpoint -q "$path"; then
+    die "$path ist nicht gemountet. Bitte fstab prüfen."
+  fi
+  if [[ -n "$want_fstype" ]]; then
+    local got; got="$(findmnt -no FSTYPE -- "$path" || true)"
+    [[ "$got" == "$want_fstype" ]] || die "$path ist kein $want_fstype (ist: ${got:-unbekannt})."
+  fi
 }
 
-check_mounts() {
-  for m in "$SCRATCH_ROOT" "$STORE_ROOT" "$RAM_CKPT_ROOT"; do
-    if ! mountpoint -q "$m"; then
-      say "WARN: $m ist nicht gemountet – versuche mount -a …"
-      mount -a || true
-      mountpoint -q "$m" || die "$m immer noch nicht gemountet."
-    fi
+ensure_bins() {
+  local miss=()
+  for b in docker ffmpeg python3 rsync awk sed grep stat; do
+    command -v "$b" >/dev/null 2>&1 || miss+=("$b")
   done
+  (( ${#miss[@]} )) && die "Fehlende Binaries: ${miss[*]}"
 }
 
-ram_ckpt_pre_clean_and_check() {
-  say "Leere RAM-Checkpoints (pre-clean)…"
-  if mountpoint -q "$RAM_CKPT_ROOT" && [[ "$(findmnt -no FSTYPE "$RAM_CKPT_ROOT")" == "tmpfs" ]]; then
-    safe_empty_dir "$RAM_CKPT_ROOT"
-    local free_kb
-    free_kb="$(df -k --output=avail "$RAM_CKPT_ROOT" | awk 'NR==2{print $1}')"
-    local free_b=$((free_kb*1024))
-    local free_h
-    free_h="$(bytes_to_human "$free_b")"
-    say "RAM-ckpt frei: $free_h"
-    local need=$(( RAMCKPT_MIN_FREE_GB * 1024 * 1024 * 1024 ))
-    (( free_b < need )) && die "Zu wenig freier RAM-ckpt (benötigt >= ${RAMCKPT_MIN_FREE_GB}G)."
-  else
-    die "RAM_CKPT_ROOT ($RAM_CKPT_ROOT) ist kein tmpfs-Mount."
+ensure_docker_image_or_pull() {
+  # ensure_docker_image_or_pull <image> [fallback_image]
+  local img="$1"; local fallback="${2:-}"
+  if docker image inspect "$img" >/dev/null 2>&1; then
+    return 0
   fi
+  say "Docker-Image fehlt: ${img} → versuche docker pull …"
+  if docker pull "$img"; then
+    return 0
+  fi
+  if [[ -n "$fallback" ]]; then
+    say "Pull für ${img} fehlgeschlagen. Probiere Fallback: ${fallback} …"
+    if docker image inspect "$fallback" >/dev/null 2>&1 || docker pull "$fallback"; then
+      export IMG_WHISPER="$fallback"
+      say "Nutze Fallback-Image: ${IMG_WHISPER}"
+      return 0
+    fi
+  fi
+
+  # Zusätzlicher Hinweis für Custom-Images ohne Registry-Pfad
+  if [[ "$img" != */* ]]; then
+    cat >&2 <<EOF
+ERROR: Konnte Docker-Image "${img}" nicht finden/pullen.
+- Das sieht nach einem lokalen/custom Image ohne Registry-Pfad aus.
+- Bitte:
+  a) baue es lokal (docker build -t ${img} <DEIN_DOCKERFILE_VERZEICHNIS>)
+  b) oder setze IMG_XTTS auf ein pullbares Image (mit Registry, z.B. ghcr.io/…/xtts-finetune:cu121)
+EOF
+  fi
+  return 1
 }
 
-post_clean() {
-  [[ "${CLEAN_AFTER_RUN}" == "1" ]] || return 0
-  say "Bereinige nach Export: RAM-ckpt und Scratch …"
-  if mountpoint -q "$RAM_CKPT_ROOT" && [[ "$(findmnt -no FSTYPE "$RAM_CKPT_ROOT")" == "tmpfs" ]]; then
-    safe_empty_dir "$RAM_CKPT_ROOT"
-  fi
-  if mountpoint -q "$SCRATCH_ROOT"; then
-    safe_empty_dir "$SCRATCH_ROOT" "docker-tmp"
-  fi
-}
+trap 'echo; echo "💥 Abbruch – siehe Meldung oben. (Zeile $LINENO)"; echo' ERR
 
-# Docker env-Arrays
-docker_env_persistent_cache=(
-  -e HF_HOME=/cache/hf
-  -e TRANSFORMERS_CACHE=/cache/hf/transformers
-  -e TORCH_HOME=/cache/torch
-  -e XDG_CACHE_HOME=/cache
-)
+########################
+# PREP: Binaries, Mounts, Pre-Clean
+########################
+ensure_bins
 
-docker_env_hf_token=()
-if [[ -n "${HF_TOKEN}" ]]; then
-  docker_env_hf_token+=(
-    -e "HF_TOKEN=${HF_TOKEN}"
-    -e "HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}"
-    -e "HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}"
-  )
+# Verzeichnis-Skelett (wird ggf. nach dem Leeren wieder angelegt)
+ensure_dir "$SCRATCH_ROOT"
+ensure_dir "$STORE_ROOT"
+ensure_dir "$RAM_CKPT_ROOT"
+
+# Mounts sicherstellen
+ensure_mount "$SCRATCH_ROOT" "xfs"     # dein fast_scratch
+ensure_mount "$STORE_ROOT"   "xfs"     # dein fast_store (persistent)
+ensure_mount "$RAM_CKPT_ROOT" "tmpfs"  # RAM-ckpt muss tmpfs sein
+
+# *** WICHTIG: Am Anfang IMMER leeren ***
+say "Leere RAM-Checkpoints (RAM_CKPT_ROOT) …"
+safe_empty_dir "$RAM_CKPT_ROOT"     # alles raus
+
+say "Leere Fast-Scratch (SCRATCH_ROOT) …"
+safe_empty_dir "$SCRATCH_ROOT"      # alles raus (wir legen danach neu an)
+
+# Ordnerstruktur erneut anlegen (sauber, frisch)
+ensure_dir "$SCRATCH_WAVS"
+ensure_dir "$SCRATCH_TMP"
+ensure_dir "$STORE_CKPT"
+ensure_dir "$PERSISTENT_CACHE/hf" "$PERSISTENT_CACHE/torch" "$PERSISTENT_CACHE/pip"
+ensure_dir "$SCRATCH_ROOT/docker-tmp"
+
+# RAM-Kapazität prüfen
+free_kb="$(df -k --output=avail "$RAM_CKPT_ROOT" | awk 'NR==2{print $1}')"
+free_b=$((free_kb*1024))
+free_h="$(bytes_to_human "$free_b")"
+say "RAM-ckpt frei: $free_h"
+need=$(( RAMCKPT_MIN_FREE_GB * 1024 * 1024 * 1024 ))
+(( free_b < need )) && die "Zu wenig freier RAM-ckpt (benötigt >= ${RAMCKPT_MIN_FREE_GB}G)."
+
+########################
+# DOCKER-IMAGES SICHERN (auto-pull)
+########################
+# WhisperX: Wenn dein IMG_WHISPER unbrauchbar ist, fallbacke auf ghcr.io/m-bain/whisperx:latest.
+ensure_docker_image_or_pull "$IMG_WHISPER" "ghcr.io/m-bain/whisperx:latest"
+
+# Python slim für Tokenizer-Export (klein & öffentlich)
+ensure_docker_image_or_pull "$IMG_PY_SLIM"
+
+# XTTS-Image (custom). Wir versuchen zu pullen, ansonsten klare Anleitung.
+ensure_docker_image_or_pull "$IMG_XTTS"
+
+########################
+# NAS erreichbar?
+########################
+if [[ -n "${NAS_SRC}" ]]; then
+  say "Prüfe NAS-Quelle (${NAS_SRC}) …"
+  # autofs/cifs sauber anstupsen, aber nicht ewig hängen:
+  timeout 10s bash -lc "stat -t '${NAS_SRC}' >/dev/null 2>&1 || ls -ld '${NAS_SRC}' >/dev/null 2>&1" \
+    || die "NAS-Quelle ${NAS_SRC} nicht erreichbar."
 fi
-
-########################
-# PREP
-########################
-ensure_dirs
-check_mounts
-ram_ckpt_pre_clean_and_check
 
 ########################
 # ROHDATEN SYNC (mp4/wav) → SCRATCH
 ########################
 say "Synchronisiere Rohdaten (mp4/wav) → Scratch …"
-mkdir -p "$SCRATCH_DATA"
-rsync -av --delete --include="*/" --include="*.mp4" --include="*.wav" --exclude="*" \
+ensure_dir "$SCRATCH_DATA"
+# Nur mp4/wav; .wav im Ziel sauber halten
+rsync -av --delete --timeout=30 \
+  --include="*/" --include="*.mp4" --include="*.wav" --exclude="*" \
   "${NAS_SRC}/" "${SCRATCH_DATA}/"
 
 ########################
 # Reset Segment-Outputs
 ########################
 rm -rf "${SCRATCH_DATA}/segments_json_raw" "${SCRATCH_DATA}/segments_json" "${SCRATCH_WAVS}/segments"
-mkdir -p "${SCRATCH_DATA}/segments_json_raw" "${SCRATCH_DATA}/segments_json" "${SCRATCH_WAVS}/segments"
+ensure_dir "${SCRATCH_DATA}/segments_json_raw" "${SCRATCH_DATA}/segments_json" "${SCRATCH_WAVS}/segments"
 
 ########################
-# MP4 -> WAV @24k mono (auf SCRATCH)
+# MP4 -> WAV @SR mono (SCRATCH)
 ########################
 say "Transcodieren MP4 → WAV …"
 find "${SCRATCH_DATA}" -type f -iname '*.mp4' -print0 | \
@@ -232,6 +328,7 @@ find "${SCRATCH_DATA}" -type f -iname '*.mp4' -print0 | \
 # TRANSKRIPTION (WhisperX)
 ########################
 if [[ -f "${LEXICON_FILE}" ]]; then
+  # Lexikon an Dialekt-Hinweis anhängen (einzeilig)
   DIALECT_HINT="${DIALECT_HINT} $(tr "\n" " " < "${LEXICON_FILE}")"
 fi
 
@@ -242,6 +339,7 @@ docker run --rm --gpus all \
   -v "${PERSISTENT_CACHE}":/cache \
   -v "${SCRATCH_TMP}":/tmp \
   "${docker_env_persistent_cache[@]}" \
+  "${docker_env_hf_token[@]}" \
   -e "WHISPER_FORCE_LANG=${WHISPER_FORCE_LANG}" \
   -e "WHISPER_MODEL=${WHISPER_MODEL}" \
   -e "DIALECT_HINT=${DIALECT_HINT}" \
@@ -268,10 +366,10 @@ dialect_instr=("Schreibe konsequent im Schweizerdeutsch (Bündnerdialekt), "
                "verwende Dialektorthographie und KEIN Hochdeutsch.")
 full_hint=(dialect_instr+" "+dialect_hint).strip()
 
-from whisperx.asr import TranscriptionOptions
-base_asr_opts={"initial_prompt": full_hint, "temperature": 0.5, "beam_size": 1, "best_of": 1,
-               "condition_on_previous_text": False, "suppress_tokens": [-1]}
 try:
+    from whisperx.asr import TranscriptionOptions
+    base_asr_opts={"initial_prompt": full_hint, "temperature": 0.5, "beam_size": 1, "best_of": 1,
+                   "condition_on_previous_text": False, "suppress_tokens": [-1]}
     sig=inspect.signature(TranscriptionOptions); allowed=set(sig.parameters.keys())
     asr_opts={k:v for k,v in base_asr_opts.items() if k in allowed and v is not None}
 except Exception:
@@ -398,7 +496,7 @@ for fn in sorted(os.listdir(jdir)):
         if dur<=0: continue
         out_wav=os.path.join(out,f"{stem}_seg{i:04d}.wav")
         cmd=f'ffmpeg -y -ss {st:.3f} -t {dur:.3f} -i {shlex.quote(wav)} -ar {os.environ["SR"]} -ac 1 -vn {shlex.quote(out_wav)}'
-        subprocess.run(cmd,shell=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        subprocess.run(cmd,shell=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
         cnt+=1
 print(f">> segment cutting | files: {cnt} | missing wavs: {miss}")
 PY
@@ -477,7 +575,7 @@ set -e
 cd /opt/xtts-ft
 python3 train_gpt_xtts.py \
   --output_path /workspace/ram_ckpt \
-  --metadatas /workspace/dataset/metadata_train_coqui.csv,/workspace/dataset/metadata_eval_coqui.csv,'"${LANG_TAG}"' \
+  --metadatas /workspace/dataset/metadata_train_coqui.csv,/workspace/dataset/metadata_eval_coqui.csv,'"$LANG_TAG"' \
   --num_epochs 10 \
   --batch_size 1 \
   --grad_acumm 16 \
@@ -503,41 +601,39 @@ fi
 ########################
 # EXPORT für Inference (latest_full) + Tokenizer
 ########################
-LATEST="${SYNCED_DIR:-$(ls -dt "${STORE_CKPT}"/GPT_XTTS_FT-* 2>/dev/null | head -n1 || true)}"
-if [[ -n "$LATEST" ]]; then
-  ln -sfn "$LATEST" "${STORE_CKPT}/latest_run"
-  mkdir -p "${STORE_CKPT}/latest_full"
-  cp -f "$(ls -t "$LATEST"/checkpoint_*.pth | head -n1)" "${STORE_CKPT}/latest_full/model.pth"
-  cp -f "$LATEST/config.json" "${STORE_CKPT}/latest_full/config.json" || true
+if [[ "${DO_EXPORT}" = "1" ]]; then
+  LATEST="${SYNCED_DIR:-$(ls -dt "${STORE_CKPT}"/GPT_XTTS_FT-* 2>/dev/null | head -n1 || true)}"
+  if [[ -n "$LATEST" ]]; then
+    ln -sfn "$LATEST" "${STORE_CKPT}/latest_run"
+    ensure_dir "${STORE_CKPT}/latest_full"
+    cp -f "$(ls -t "$LATEST"/checkpoint_*.pth | head -n1)" "${STORE_CKPT}/latest_full/model.pth"
+    cp -f "$LATEST/config.json" "${STORE_CKPT}/latest_full/config.json" || true
 
-  docker run --rm \
-    -v "${STORE_CKPT}/latest_full:/out" \
-    "${docker_env_hf_token[@]}" \
-    python:3.11-slim bash -lc '
+    say "Tokenizers aus HF besorgen (falls nötig) …"
+    docker run --rm \
+      -v "${STORE_CKPT}/latest_full:/out" \
+      "${docker_env_hf_token[@]}" \
+      "${IMG_PY_SLIM}" bash -lc '
 set -e
 python - <<PY
 import os, json, shutil, sys, subprocess
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub>=0.20"])
 from huggingface_hub import hf_hub_download
-
 token=os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN") or None
 dst="/out"
 repos=["coqui/XTTS-v2","coqui/XTTS-v2.0","coqui/XTTS-v2-original"]
 want_primary=["tokenizer.json"]
 want_fallback=["vocab.json","merges.txt"]
 want_optional=["tokenizer_config.json","special_tokens_map.json","added_tokens.json"]
-
 def try_dl(repo,fn):
     try:
         p=hf_hub_download(repo_id=repo, filename=fn, revision="main", token=token)
         shutil.copy2(p, os.path.join(dst, os.path.basename(fn))); return True
     except Exception: return False
-
 have_tok=False
 for r in repos:
     if any(try_dl(r,f) for f in want_primary):
         have_tok=True; break
-
 have_vm=False
 if not have_tok:
     for r in repos:
@@ -546,7 +642,6 @@ if not have_tok:
             have_vm=True
             for f in want_optional: try_dl(r,f)
             break
-
 cfg_path=os.path.join(dst,"config.json")
 if os.path.isfile(cfg_path):
     cfg=json.load(open(cfg_path,"r",encoding="utf-8")); ma=cfg.get("model_args",{}) or {}; ch=False
@@ -561,48 +656,24 @@ else:
     print("WARN: config.json fehlt in latest_full")
 PY
 '
-
-  if [[ -s "${STORE_CKPT}/latest_full/tokenizer.json" || ( -s "${STORE_CKPT}/latest_full/vocab.json" && -s "${STORE_CKPT}/latest_full/merges.txt" ) ]]; then
-    echo "✅ Inference-Export bereit: ${STORE_CKPT}/latest_full"
+    if [[ -s "${STORE_CKPT}/latest_full/tokenizer.json" || ( -s "${STORE_CKPT}/latest_full/vocab.json" && -s "${STORE_CKPT}/latest_full/merges.txt" ) ]]; then
+      echo "✅ Inference-Export bereit: ${STORE_CKPT}/latest_full"
+    else
+      echo "WARN: Tokenizer-Assets konnten nicht geladen werden – bitte manuell nach ${STORE_CKPT}/latest_full/ legen."
+    fi
   else
-    echo "WARN: Tokenizer-Assets konnten nicht geladen werden – bitte manuell nach ${STORE_CKPT}/latest_full/ legen."
+    echo "WARN: Kein Checkpoint gefunden."
   fi
-else
-  echo "WARN: Kein Checkpoint gefunden."
 fi
 
 ########################
-# Persistente Referenzen (Top-5 längste Segmente kopieren)
-########################
-mkdir -p "${STORE_ROOT}/tts_refs"
-python3 - <<'PY'
-import os,glob,subprocess,shlex
-root=os.environ["SCRATCH_ROOT"]
-segdir=os.path.join(root,"dataset","wavs","segments")
-dst=os.path.join(os.environ["STORE_ROOT"],"tts_refs")
-os.makedirs(dst,exist_ok=True)
-cands=sorted(glob.glob(os.path.join(segdir,"*.wav")))
-dur=[]
-for f in cands:
-    try:
-        out=subprocess.check_output(["bash","-lc",f'ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 {shlex.quote(f)}'])
-        d=float(out.strip() or 0.0)
-        dur.append((d,f))
-    except Exception:
-        pass
-for i,(_,f) in enumerate(sorted(dur,reverse=True)[:5],1):
-    bn=os.path.basename(f)
-    target=os.path.join(dst,f"{i:02d}_{bn}")
-    try:
-        if not os.path.exists(target):
-            subprocess.check_call(["cp","-n",f,target])
-    except Exception:
-        pass
-print(f">> copied {min(5,len(dur))} reference wavs to tts_refs")
-PY
-
 # Nachlauf-Cleanup
-post_clean
+########################
+if [[ "${CLEAN_AFTER_RUN}" == "1" ]]; then
+  say "Bereinige nach Export: RAM-ckpt und Scratch …"
+  safe_empty_dir "$RAM_CKPT_ROOT"
+  safe_empty_dir "$SCRATCH_ROOT"
+fi
 
 echo
 echo "  Scratch : ${SCRATCH_ROOT}"
