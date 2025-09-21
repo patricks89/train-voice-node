@@ -34,9 +34,6 @@ set -euo pipefail
 #   STORE/cache/{hf,torch,pip}      werden in Container nach /cache gemountet
 #   HF_HOME, TRANSFORMERS_CACHE,
 #   TORCH_HOME, XDG_CACHE_HOME      zeigen alle auf /cache (persistent)
-###############################################################################
-###############################################################################
-# XTTS Finetune + WhisperX ASR — v10 (self-healing edition)
 #
 # STORAGE-LAYOUT (wie bei dir):
 #   SCRATCH  : /mnt/fast_scratch  (flüchtig; Transcodierung, WAV-Segmente, tmp)
