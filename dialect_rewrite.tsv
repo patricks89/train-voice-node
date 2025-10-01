@@ -1,0 +1,13 @@
+# Regex|Ersatz
+\bauch\b|au
+\bauch\b|au
+\bwir\b|mir
+\bWir\b|Mir
+\bwirklich\b|würkli
+\bWirklich\b|Würkli
+\bnicht\b|nid
+\bNicht\b|Nid
+\bklein\b|chli
+\bKlein\b|Chli
+\bund\b|u
+\bUnd\b|U
