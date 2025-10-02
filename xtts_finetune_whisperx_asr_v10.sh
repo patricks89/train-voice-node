@@ -92,7 +92,7 @@ STORE_CACHE="${STORE_ROOT}/cache"
 export DOCKER_TMPDIR="${DOCKER_TMPDIR:-${SCRATCH_ROOT}/docker-tmp}"
 
 # User-vars / Tokens
-HF_TOKEN="${HF_TOKEN:-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}"
+HF_TOKEN="${HF_TOKEN:-hf_}"
 NAS_SRC="${NAS_SRC:-/mnt/nas/Allgemein/VoiceClone/standpunkte}"
 
 # WhisperX / ASR
